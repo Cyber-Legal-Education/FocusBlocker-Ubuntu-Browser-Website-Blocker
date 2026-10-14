@@ -10,9 +10,14 @@ you are holding, so review it first):
 
     sudo python3 focusblocker.py --install
 
-Then launch the GUI normally:
+Then launch the GUI normally, or from your application menu (--install adds a
+"FocusBlocker" entry there):
 
     python3 focusblocker.py
+
+To add your own menu entry and a desktop shortcut (run as your normal user):
+
+    python3 focusblocker.py --install-launcher      # undo: --remove-launcher
 
 To remove everything, including the installed copy and polkit policy:
 
@@ -35,24 +40,32 @@ if os.geteuid() == 0:
     sys.path[:] = [p for p in sys.path if p not in _script_dirs]
 
 import argparse
+import base64
 import contextlib
 import errno
 import fcntl
+import grp
+import hashlib
 import ipaddress
 import json
+import math
+import pwd
 import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 APP_NAME = "FocusBlocker"
 HOSTS_FILE = Path("/etc/hosts")
@@ -61,15 +74,34 @@ HOSTS_BEGIN = "# BEGIN FOCUSBLOCKER MANAGED BLOCK"
 HOSTS_END = "# END FOCUSBLOCKER MANAGED BLOCK"
 CONFIG_DIR = Path("/etc/focusblocker")
 CONFIG_FILE = CONFIG_DIR / "config.json"
-LIB_DIR = Path("/usr/local/lib/focusblocker")
+LIB_DIR = Path("/usr/lib/focusblocker")  # every parent is root-only on all distros
+LEGACY_LIB_DIR = Path("/usr/local/lib/focusblocker")  # 2.0.x location; its parents can be group-writable
 INSTALLED_SCRIPT = LIB_DIR / "focusblocker.py"
 UNIT_FILE = Path("/etc/systemd/system/focusblocker-browser-guard.service")
 UNIT_NAME = "focusblocker-browser-guard.service"
 POLICY_FILE = Path("/usr/share/polkit-1/actions/org.focusblocker.policy")
 LOCK_FILE = Path("/run/focusblocker.lock")
+SYSTEM_DESKTOP_FILE = Path("/usr/share/applications/focusblocker.desktop")
+SYSTEM_ICON_FILE = Path("/usr/share/icons/hicolor/256x256/apps/focusblocker.png")
 
 MAX_DOMAINS = 10_000
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+MAX_ENTRY_LENGTH = 2048     # characters per domain/URL entry, checked before any URL/IDNA parsing
+# Components at or above this path are not inspected by _untrusted_component (tests point it at a temp dir).
+TRUST_ANCHOR = Path("/")
+# Environment for root-side subprocesses: never inherit SYSTEMD_*/PATH/LD_* style variables.
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C"}
+
+# Hostnames the root side refuses to block, because doing so breaks package updates, time sync,
+# connectivity checks or the machine's own name. A seatbelt against mistakes and against another
+# process of yours raising the polkit prompt with a harmful list; not a security boundary
+# (an administrator can still edit /etc/hosts by hand).
+PROTECTED_HOSTS = frozenset({
+    "archive.ubuntu.com", "security.ubuntu.com", "ports.ubuntu.com", "changelogs.ubuntu.com",
+    "esm.ubuntu.com", "motd.ubuntu.com", "ntp.ubuntu.com", "keyserver.ubuntu.com",
+    "connectivity-check.ubuntu.com", "api.snapcraft.io", "livepatch.canonical.com",
+    "contracts.canonical.com", "deb.debian.org", "security.debian.org", "ftp.debian.org",
+})
 GUARD_INTERVAL = 1.0        # seconds between process scans
 KILL_GRACE_SECONDS = 5.0    # SIGTERM first; SIGKILL if still alive after this
 
@@ -182,6 +214,9 @@ def normalize_domain(value: str) -> str:
     value = value.strip()
     if not value:
         raise ValueError("Enter a website hostname or URL.")
+    if len(value) > MAX_ENTRY_LENGTH:
+        raise ValueError(f"Entry is too long ({len(value)} characters; limit {MAX_ENTRY_LENGTH}). "
+                         "Paste just the hostname.")
     if value.startswith("*."):
         raise ValueError("Wildcard domains are not supported by /etc/hosts. Add each hostname/subdomain separately.")
     candidate = value if "://" in value else "//" + value
@@ -210,15 +245,39 @@ def normalize_domain(value: str) -> str:
     return hostname
 
 
+def _local_hostnames() -> set[str]:
+    names: set[str] = set()
+    with contextlib.suppress(OSError):
+        names.add(socket.gethostname().strip().lower())
+    with contextlib.suppress(OSError, UnicodeError):
+        names.add(Path("/etc/hostname").read_text(encoding="utf-8").strip().lower())
+    names.discard("")
+    return names
+
+
+def _protected_hosts() -> set[str]:
+    return set(PROTECTED_HOSTS) | _local_hostnames()
+
+
+def _check_not_protected(domain: str, protected: set[str]) -> None:
+    if domain in protected:
+        raise ValueError(
+            f"'{domain}' is protected: blocking it could break system updates or this machine's own "
+            f"networking. If you really need it, edit {HOSTS_FILE} by hand.")
+
+
 def parse_domain_lines(text: str) -> list[str]:
     """Parse the GUI text box: one hostname/URL per line, '#' starts a comment."""
     seen: dict[str, None] = {}
+    protected = _protected_hosts()
     for number, raw in enumerate(text.splitlines(), 1):
         line = re.sub(r"(^|\s)#.*$", "", raw).strip()
         if not line:
             continue
         try:
-            seen[normalize_domain(line)] = None
+            domain = normalize_domain(line)
+            _check_not_protected(domain, protected)
+            seen[domain] = None
         except ValueError as exc:
             raise ValueError(f"Line {number}: {exc}") from exc
     return sorted(seen)
@@ -320,7 +379,7 @@ def guard_pass(self_pid: int, tracked: dict[int, float], now: float,
     """One scan: SIGTERM new browser processes, SIGKILL ones that outlive the grace period."""
     if pids is None:
         try:
-            pids = [name for name in os.listdir("/proc") if name.isdigit()]
+            pids = [name for name in os.listdir("/proc") if name.isascii() and name.isdecimal()]
         except OSError:
             return
     seen: set[int] = set()
@@ -434,8 +493,12 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The domains list is invalid.")
     if len(raw_domains) > MAX_DOMAINS:
         raise ValueError(f"Too many domains ({len(raw_domains)}); the limit is {MAX_DOMAINS}.")
+    domains = sorted({normalize_domain(item) for item in raw_domains})
+    protected = _protected_hosts()
+    for domain in domains:
+        _check_not_protected(domain, protected)
     return {
-        "domains": sorted({normalize_domain(item) for item in raw_domains}),
+        "domains": domains,
         "block_browsers": _strict_bool(payload, "block_browsers"),
         "include_download_domains": _strict_bool(payload, "include_download_domains"),
     }
@@ -458,22 +521,68 @@ def _require_root() -> None:
         raise FocusBlockerError("System changes require administrator permissions.")
 
 
+def _group_is_private(gid: int, owner_uid: int) -> bool:
+    """True if *gid* is a per-user private group that nobody but *owner_uid* belongs to.
+
+    Ubuntu's default umask (002) makes files you create group-writable, so a group-write bit is
+    harmless when the group contains only you.
+    """
+    try:
+        owner = pwd.getpwuid(owner_uid).pw_name
+        if set(grp.getgrgid(gid).gr_mem) - {owner}:
+            return False
+        return all(user.pw_uid == owner_uid for user in pwd.getpwall() if user.pw_gid == gid)
+    except (KeyError, OSError):
+        return False
+
+
+def _untrusted_component(path: Path, allowed_uids: set[int], *, private_group_ok: bool = False,
+                         sticky_ok: bool = False) -> str | None:
+    """Return the first component of *path* (the file or any parent directory) that is owned by a
+    uid outside *allowed_uids* or is writable by others; None if the whole chain is clean.
+
+    The whole chain matters: whoever can write ANY parent directory can rename it away and put
+    their own file in its place, so the file's own mode proves nothing.
+    """
+    real = Path(os.path.realpath(path))
+    for component in (real, *real.parents):
+        if component == TRUST_ANCHOR:
+            break
+        st = os.lstat(component)
+        if st.st_uid not in allowed_uids:
+            return str(component)
+        sticky_dir = sticky_ok and stat.S_ISDIR(st.st_mode) and bool(st.st_mode & stat.S_ISVTX)
+        if st.st_mode & 0o002 and not sticky_dir:
+            return str(component)
+        if (st.st_mode & 0o020 and not sticky_dir
+                and not (private_group_ok and _group_is_private(st.st_gid, st.st_uid))):
+            return str(component)
+    return None
+
+
 def _installed_script_problem() -> str | None:
     """Describe why the installed copy can't be trusted, or None if it is fine."""
     try:
         file_st = os.lstat(INSTALLED_SCRIPT)
-        dir_st = os.lstat(LIB_DIR)
     except FileNotFoundError:
         return "FocusBlocker is not installed system-wide yet."
     except OSError as exc:
         return f"Cannot inspect the installed FocusBlocker copy: {exc}."
-    for label, st in (("script", file_st), ("directory", dir_st)):
-        if stat.S_ISLNK(st.st_mode):
-            return f"The installed FocusBlocker {label} must not be a symlink."
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            return f"The installed FocusBlocker {label} must be owned by root and not writable by others."
+    if stat.S_ISLNK(file_st.st_mode):
+        return "The installed FocusBlocker script must not be a symlink."
     if not stat.S_ISREG(file_st.st_mode):
         return "The installed FocusBlocker script is not a regular file."
+    if file_st.st_uid != 0 or file_st.st_mode & 0o022:
+        return "The installed FocusBlocker script must be owned by root and not writable by others."
+    if LIB_DIR.is_symlink():
+        return "The installed FocusBlocker directory must not be a symlink."
+    try:
+        bad = _untrusted_component(LIB_DIR, {0})
+    except OSError as exc:
+        return f"Cannot inspect the installed FocusBlocker directory: {exc}."
+    if bad:
+        return (f"The installed FocusBlocker directory is not safe: {bad} must be owned by root "
+                "and not writable by others.")
     return None
 
 
@@ -526,7 +635,7 @@ def _atomic_write(path: Path, content: str | bytes, mode: int = 0o644, uid: int 
 @contextlib.contextmanager
 def _exclusive_lock(timeout: float = 30.0):
     """Serialize privileged operations (two GUIs, or us vs. a retry)."""
-    fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -544,7 +653,8 @@ def _exclusive_lock(timeout: float = 30.0):
 
 def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     command = ["/usr/bin/systemctl", *args]
-    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=30, env=SAFE_ENV)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "systemctl failed").strip()
         raise FocusBlockerError(f"Command failed ({' '.join(command)}): {detail}")
@@ -575,7 +685,7 @@ def _write_hosts(text: str) -> None:
 def _flush_dns() -> None:
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(["/usr/bin/resolvectl", "flush-caches"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=False, timeout=15)
+                       stderr=subprocess.DEVNULL, check=False, timeout=15, env=SAFE_ENV)
 
 
 def _unit_text() -> str:
@@ -632,9 +742,20 @@ def _remove_browser_service() -> None:
 
 
 def _ensure_lib_dir() -> None:
+    """Create the install directory fresh, or reuse one that is already root-owned and locked down.
+
+    A pre-existing directory that fails the check is refused, not adopted: chown/chmod would leave
+    whatever its previous owner put inside.
+    """
     if LIB_DIR.is_symlink():
         raise FocusBlockerError(f"{LIB_DIR} is a symlink; refusing to use it.")
-    LIB_DIR.mkdir(parents=True, exist_ok=True)
+    if LIB_DIR.exists():
+        bad = _untrusted_component(LIB_DIR, {0})
+        if bad:
+            raise FocusBlockerError(f"{LIB_DIR} already exists but {bad} is not owned by root or is writable "
+                                    "by others. Remove or repair it, then retry.")
+        return
+    LIB_DIR.mkdir(parents=True)
     os.chown(LIB_DIR, 0, 0)
     os.chmod(LIB_DIR, 0o755)
 
@@ -697,7 +818,7 @@ def apply_system_config(raw_payload: dict[str, Any]) -> str:
             raise FocusBlockerError(f"Applying settings failed and was rolled back: {exc}") from exc
 
     _flush_dns()
-    return f"Applied {len(all_domains)} hostname(s). {browser_msg}"
+    return f"Applied {len(expand_domain_hosts(all_domains))} hostname(s). {browser_msg}"
 
 
 def remove_all_system_rules() -> str:
@@ -717,30 +838,215 @@ def remove_all_system_rules() -> str:
             f"The backup {HOSTS_BACKUP} was kept.")
 
 
+def _remove_legacy_install() -> None:
+    """Remove the 2.0.x layout (/usr/local/lib/focusblocker). Only the known file and an empty dir."""
+    if LEGACY_LIB_DIR.is_symlink():
+        return
+    with contextlib.suppress(OSError):
+        (LEGACY_LIB_DIR / "focusblocker.py").unlink(missing_ok=True)
+        LEGACY_LIB_DIR.rmdir()
+
+
 def install_system() -> str:
     """Install this script as the root-owned copy that pkexec/systemd will run. Run via sudo."""
     _require_root()
     source = Path(os.path.realpath(__file__))
+    # One descriptor: the bytes we check, hash and install are the very same bytes.
+    with open(source, "rb") as handle:
+        source_stat = os.fstat(handle.fileno())
+        data = handle.read()
+    if source_stat.st_mode & 0o002:
+        raise FocusBlockerError(f"Refusing to install a world-writable script: {source}")
+    notes = []
+    if source_stat.st_uid != 0:
+        notes.append(f"Note: {source} is owned by uid {source_stat.st_uid}, so anything running as that user "
+                     "could have modified it. Compare the hash above with the file you reviewed.")
     _ensure_lib_dir()
+    if INSTALLED_SCRIPT.is_symlink():
+        INSTALLED_SCRIPT.unlink()
     if source != Path(os.path.realpath(INSTALLED_SCRIPT)):
-        if source.stat().st_mode & 0o002:
-            raise FocusBlockerError(f"Refusing to install a world-writable script: {source}")
-        _atomic_write(INSTALLED_SCRIPT, source.read_bytes(), 0o755)
+        _atomic_write(INSTALLED_SCRIPT, data, 0o755)
     _atomic_write(POLICY_FILE, POLICY_XML, 0o644)
+    _atomic_write(SYSTEM_ICON_FILE, _icon_png(256), 0o644)
+    _atomic_write(SYSTEM_DESKTOP_FILE, _desktop_entry(INSTALLED_SCRIPT, SYSTEM_ICON_FILE), 0o644)
+    _remove_legacy_install()
+    if UNIT_FILE.exists():  # an existing guard may still point at the old location
+        _atomic_write(UNIT_FILE, _unit_text(), 0o644)
+        _run_systemctl("daemon-reload", check=False)
     _run_systemctl("try-restart", UNIT_NAME, check=False)
-    return (f"Installed {INSTALLED_SCRIPT} and the polkit policy. "
-            f"You can now run the GUI as your normal user: python3 {source}")
+    problem = _installed_script_problem()
+    if problem:
+        raise FocusBlockerError(f"Installed, but the result would be refused at run time: {problem}")
+    message = (f"Installed {INSTALLED_SCRIPT}, the polkit policy and an application-menu entry "
+               f"(search for \"FocusBlocker\"; log out and in if it doesn't appear yet). "
+               f"SHA-256 of the installed script: {hashlib.sha256(data).hexdigest()}. "
+               f"For a desktop shortcut, run as your normal user: python3 {source} --install-launcher")
+    return " ".join([message, *notes])
 
 
 def uninstall_system() -> str:
     """Remove rules, service, installed copy and polkit policy (keeps the hosts backup)."""
     _require_root()
     message = remove_all_system_rules()
-    for path in (INSTALLED_SCRIPT, POLICY_FILE):
+    _remove_legacy_install()
+    for path in (INSTALLED_SCRIPT, POLICY_FILE, SYSTEM_DESKTOP_FILE, SYSTEM_ICON_FILE):
         path.unlink(missing_ok=True)
     with contextlib.suppress(OSError):
         LIB_DIR.rmdir()
-    return message + " The installed script and polkit policy were removed."
+    return message + " The installed script, polkit policy and menu entry were removed."
+
+
+# --------------------------------------------------------------------------- #
+# Icon and launchers
+# --------------------------------------------------------------------------- #
+
+def _icon_png(size: int = 256) -> bytes:
+    """Render the app icon (a focus target with a block slash) as an RGBA PNG, no dependencies."""
+    half = size / 2.0
+    corner = 0.22 * size
+    ring_r, ring_w = 0.30 * size, 0.075 * size
+    dot_r = 0.10 * size
+    slash_w = 0.060 * size
+    slash_reach = ring_r + ring_w
+    bg, white, teal, red = (0x24, 0x3B, 0x55), (255, 255, 255), (0x3E, 0xC1, 0xB3), (0xE5, 0x48, 0x4D)
+
+    def cover(distance: float) -> float:  # signed distance (px) -> anti-aliased coverage 0..1
+        return min(1.0, max(0.0, 0.5 - distance))
+
+    def mix(base: tuple, top: tuple, alpha: float) -> tuple:
+        return tuple(b + (t - b) * alpha for b, t in zip(base, top))
+
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)  # PNG filter type 0
+        py = y + 0.5 - half
+        for x in range(size):
+            px = x + 0.5 - half
+            qx, qy = abs(px) - (half - corner), abs(py) - (half - corner)
+            a_bg = cover(math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - corner)
+            r = math.hypot(px, py)
+            colour = mix(bg, white, cover(abs(r - ring_r) - ring_w / 2))
+            colour = mix(colour, teal, cover(r - dot_r))
+            a_slash = cover(abs(px - py) / math.sqrt(2) - slash_w / 2) * cover(r - slash_reach)
+            colour = mix(colour, red, a_slash)
+            raw += bytes((round(colour[0]), round(colour[1]), round(colour[2]), round(255 * a_bg)))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def _desktop_exec_quote(path: str) -> str:
+    """Quote a path for a .desktop Exec= line."""
+    if any(ch in path for ch in '"`$\\\n'):
+        raise FocusBlockerError(f"The path contains characters a .desktop file cannot hold safely: {path!r}. "
+                                "Move the script to a simpler path and try again.")
+    return '"' + path.replace("%", "%%") + '"'
+
+
+def _desktop_entry(script: Path, icon: Path) -> str:
+    if any(ch in str(icon) for ch in "\r\n"):
+        raise FocusBlockerError(f"The icon path contains a line break: {str(icon)!r}")
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=FocusBlocker\n"
+        "GenericName=Website and Browser Blocker\n"
+        "Comment=Block distracting websites and browsers\n"
+        f"Exec=/usr/bin/python3 -I {_desktop_exec_quote(str(script))}\n"
+        f"Icon={icon}\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+        "Keywords=focus;block;website;productivity;distraction;\n"
+        "StartupNotify=true\n"
+        "StartupWMClass=FocusBlocker\n"
+    )
+
+
+def _user_data_dir() -> Path:
+    configured = os.environ.get("XDG_DATA_HOME", "")
+    return Path(configured) if configured.startswith("/") else Path.home() / ".local" / "share"
+
+
+def _desktop_dir() -> Path | None:
+    """The user's Desktop folder, or None if there isn't a real one."""
+    try:
+        reported = subprocess.run(["xdg-user-dir", "DESKTOP"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        reported = ""
+    for candidate in (reported, str(Path.home() / "Desktop")):
+        path = Path(candidate) if candidate else None
+        if path and path.is_dir() and path != Path.home():
+            return path
+    return None
+
+
+def _user_launcher_paths() -> tuple[Path, Path]:
+    data = _user_data_dir()
+    return (data / "applications" / "focusblocker.desktop",
+            data / "icons" / "hicolor" / "256x256" / "apps" / "focusblocker.png")
+
+
+def install_launcher() -> str:
+    """Add FocusBlocker to the user's application menu and put a shortcut on the desktop."""
+    if os.geteuid() == 0:
+        raise FocusBlockerError("Run this as your normal user (without sudo) so the shortcut lands in your account.")
+    # Prefer the root-owned installed copy: it can't be tampered with by user-level processes.
+    use_installed = _installed_script_problem() is None
+    script = INSTALLED_SCRIPT if use_installed else Path(os.path.realpath(__file__))
+    if not use_installed:
+        # The shortcut will run this file as you, so nobody else may be able to change it.
+        bad = _untrusted_component(script, {0, os.geteuid()}, private_group_ok=True, sticky_ok=True)
+        if bad:
+            raise FocusBlockerError(
+                f"Refusing to create a launcher for {script}: {bad} is owned by another user or writable by "
+                "other users, so they could change what the shortcut runs. Move the script into a folder only "
+                "you control (for example ~/.local/share/focusblocker), or install it system-wide with: "
+                f"sudo python3 {shlex.quote(str(script))} --install")
+    app_file, icon_file = _user_launcher_paths()
+    _atomic_write(icon_file, _icon_png(256), 0o644)
+    entry = _desktop_entry(script, icon_file)
+    _atomic_write(app_file, entry, 0o644)
+    notes = [f"Added FocusBlocker to your application menu ({app_file})."]
+    desktop = _desktop_dir()
+    if desktop is None:
+        notes.append("No Desktop folder was found, so no desktop shortcut was created.")
+    else:
+        shortcut = desktop / "FocusBlocker.desktop"
+        _atomic_write(shortcut, entry, 0o755)
+        gio = shutil.which("gio")
+        if gio:  # lets GNOME launch it without the "Allow Launching" step
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run([gio, "set", str(shortcut), "metadata::trusted", "true"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        notes.append(f"Placed a shortcut on your desktop ({shortcut}). If it shows a generic icon or a warning, "
+                     "right-click it and choose 'Allow Launching'.")
+    if script != INSTALLED_SCRIPT:
+        notes.append(f"It launches {script}; run --install-launcher again if you move that file.")
+    return " ".join(notes)
+
+
+def remove_launcher() -> str:
+    """Remove the per-user menu entry, icon and desktop shortcut."""
+    if os.geteuid() == 0:
+        raise FocusBlockerError("Run this as your normal user (without sudo).")
+    app_file, icon_file = _user_launcher_paths()
+    targets = [app_file, icon_file]
+    desktop = _desktop_dir()
+    if desktop is not None:
+        targets.append(desktop / "FocusBlocker.desktop")
+    removed = 0
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            removed += 1
+    return f"Removed {removed} launcher file(s)."
 
 
 # --------------------------------------------------------------------------- #
@@ -786,15 +1092,26 @@ def launch_gui() -> int:
     problem = _installed_script_problem()
     existing = _load_existing_config()
 
-    root = tk.Tk()
+    root = tk.Tk(className="FocusBlocker")  # matches StartupWMClass in the .desktop file
     root.title(f"FocusBlocker for Ubuntu {__version__}")
+    icon_image = small_icon = None
+    try:
+        icon_image = tk.PhotoImage(data=base64.b64encode(_icon_png(128)).decode("ascii"))
+        root.iconphoto(True, icon_image)
+        small_icon = icon_image.subsample(2, 2)
+    except tk.TclError:
+        icon_image = small_icon = None
     root.geometry("720x680")
     root.minsize(620, 600)
 
     frame = tk.Frame(root, padx=18, pady=16)
     frame.pack(fill="both", expand=True)
 
-    tk.Label(frame, text="FocusBlocker", font=("TkDefaultFont", 18, "bold")).pack(anchor="w")
+    header = tk.Frame(frame)
+    header.pack(anchor="w")
+    if small_icon is not None:
+        tk.Label(header, image=small_icon).pack(side="left", padx=(0, 10))
+    tk.Label(header, text="FocusBlocker", font=("TkDefaultFont", 18, "bold")).pack(side="left")
     tk.Label(frame, text="Manage local hostname blocks and a system-wide browser process guard.",
              wraplength=670, justify="left").pack(anchor="w", pady=(4, 12))
 
@@ -901,9 +1218,19 @@ def launch_gui() -> int:
             return
         run_async("Removed", ["--remove-system"], None)
 
-    apply_button = tk.Button(buttons, text="Apply system-wide", command=apply_clicked, padx=12, pady=6)
+    def shortcut_clicked() -> None:
+        try:
+            messagebox.showinfo("Desktop shortcut", install_launcher(), parent=root)
+        except (FocusBlockerError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            messagebox.showerror("Could not add shortcut", str(exc), parent=root)
+
+    apply_button = tk.Button(buttons, text="Start blocking", command=apply_clicked, padx=14, pady=6,
+                             font=("TkDefaultFont", 10, "bold"))
     apply_button.pack(side="left")
-    remove_button = tk.Button(buttons, text="Remove all FocusBlocker rules", command=remove_clicked, padx=12, pady=6)
+    tk.Button(buttons, text="Add desktop shortcut", command=shortcut_clicked, padx=12, pady=6
+              ).pack(side="left", padx=(10, 0))
+    remove_button = tk.Button(buttons, text="Stop blocking (remove all rules)", command=remove_clicked,
+                              padx=12, pady=6)
     remove_button.pack(side="right")
     set_busy(False)
 
@@ -933,6 +1260,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="install the root-owned copy and polkit policy (run with sudo)")
     group.add_argument("--uninstall", action="store_true",
                        help="remove all rules, the service, the installed copy and the policy (run with sudo)")
+    group.add_argument("--install-launcher", action="store_true",
+                       help="add a menu entry and desktop shortcut for the current user (no sudo)")
+    group.add_argument("--remove-launcher", action="store_true",
+                       help="remove the current user's menu entry and desktop shortcut")
     group.add_argument("--apply-system", action="store_true", help=argparse.SUPPRESS)   # JSON on stdin
     group.add_argument("--remove-system", action="store_true", help=argparse.SUPPRESS)
     group.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
@@ -945,6 +1276,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.uninstall:
             print(uninstall_system())
+            return 0
+        if args.install_launcher:
+            print(install_launcher())
+            return 0
+        if args.remove_launcher:
+            print(remove_launcher())
             return 0
         if args.apply_system:
             _require_trusted_install()
