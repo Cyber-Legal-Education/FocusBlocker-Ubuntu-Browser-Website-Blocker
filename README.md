@@ -4,7 +4,7 @@
 
 FocusBlocker is a Python/Tkinter desktop application for blocking selected website hostnames and optionally terminating selected browser processes on Ubuntu. The GUI runs as a regular user. System changes are performed after PolicyKit (`pkexec`) authentication by a root-owned installed copy of the script.
 
-> **Security note:** FocusBlocker is a practical distraction blocker, not a tamper-proof kiosk or security policy. A system administrator with root access can still change the operating system directly.
+> **Security note:** FocusBlocker is a simple distraction blocker, not a tamper-proof kiosk or security policy. A system administrator with root access can still change the operating system directly. This program is for learning; please use your best judgment when using or modifying this program.
 
 ## Features
 
