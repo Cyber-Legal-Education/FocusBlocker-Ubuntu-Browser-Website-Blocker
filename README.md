@@ -216,4 +216,4 @@ Then reopen the GUI. The installer attempts to restart an existing browser-guard
 
 ## License
 
-No license is specified. Add one before redistribution if you want to grant explicit reuse rights.
+None. This is for fun.
