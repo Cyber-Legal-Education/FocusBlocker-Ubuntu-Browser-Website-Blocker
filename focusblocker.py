@@ -19,11 +19,17 @@ To add your own menu entry and a desktop shortcut (run as your normal user):
 
     python3 focusblocker.py --install-launcher      # undo: --remove-launcher
 
+If clicking the icon does nothing, run this in a terminal for a health report
+(errors from menu launches are also saved to ~/.cache/focusblocker/launch.log):
+
+    python3 focusblocker.py --doctor
+
 To remove everything, including the installed copy and polkit policy:
 
     sudo python3 focusblocker.py --uninstall
 
-This is a practical distraction blocker, not a tamper-proof kiosk/security policy.
+Rule-lock timers are enforced by the privileged system-change path, but this is still a practical
+distraction blocker, not a tamper-proof kiosk/security policy. A local administrator can bypass it.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ import errno
 import fcntl
 import grp
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import math
@@ -60,12 +67,13 @@ import struct
 import subprocess
 import tempfile
 import time
+import traceback
 import zlib
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-__version__ = "2.1.0"
+__version__ = "2.3.0"
 
 APP_NAME = "FocusBlocker"
 HOSTS_FILE = Path("/etc/hosts")
@@ -74,6 +82,7 @@ HOSTS_BEGIN = "# BEGIN FOCUSBLOCKER MANAGED BLOCK"
 HOSTS_END = "# END FOCUSBLOCKER MANAGED BLOCK"
 CONFIG_DIR = Path("/etc/focusblocker")
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOCK_STATE_FILE = CONFIG_DIR / "rules-lock.json"  # root-owned, persistent rule-edit lock
 LIB_DIR = Path("/usr/lib/focusblocker")  # every parent is root-only on all distros
 LEGACY_LIB_DIR = Path("/usr/local/lib/focusblocker")  # 2.0.x location; its parents can be group-writable
 INSTALLED_SCRIPT = LIB_DIR / "focusblocker.py"
@@ -497,11 +506,65 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     protected = _protected_hosts()
     for domain in domains:
         _check_not_protected(domain, protected)
+    lock_minutes = payload.get("lock_minutes", 60)
+    if isinstance(lock_minutes, bool) or not isinstance(lock_minutes, int) or not 0 <= lock_minutes <= 10080:
+        raise ValueError("'lock_minutes' must be a whole number from 0 to 10080.")
     return {
         "domains": domains,
         "block_browsers": _strict_bool(payload, "block_browsers"),
         "include_download_domains": _strict_bool(payload, "include_download_domains"),
+        "lock_minutes": lock_minutes,
     }
+
+
+
+def _read_lock_until() -> float | None:
+    """Read the persistent root-owned lock deadline. Invalid state fails closed."""
+    try:
+        st = os.lstat(LOCK_STATE_FILE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FocusBlockerError(f"Cannot inspect the rule lock state: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise FocusBlockerError("The rule lock state is not a regular file; refusing to change rules.")
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        raise FocusBlockerError("The rule lock state must be root-owned and not writable by group/others.")
+    try:
+        state = json.loads(LOCK_STATE_FILE.read_text(encoding="utf-8"))
+        until = state.get("lock_until") if isinstance(state, dict) else None
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
+            raise ValueError("missing or invalid lock_until")
+        return float(until)
+    except (OSError, ValueError, TypeError) as exc:
+        raise FocusBlockerError("The rule lock state is invalid; refusing to change rules.") from exc
+
+
+def _ensure_rules_unlocked() -> None:
+    """Enforce the timer in the privileged path, not just by disabling GUI controls."""
+    until = _read_lock_until()
+    if until is None:
+        return
+    remaining = until - time.time()
+    if remaining > 0:
+        minutes = max(1, math.ceil(remaining / 60))
+        raise FocusBlockerError(
+            f"FocusBlocker rules are locked for about {minutes} more minute(s). "
+            "Editing or stopping blocking is unavailable until the timer expires."
+        )
+    with contextlib.suppress(FileNotFoundError):
+        LOCK_STATE_FILE.unlink()
+
+
+def _format_remaining(seconds: float) -> str:
+    seconds = max(0, int(math.ceil(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m remaining"
+    if minutes:
+        return f"{minutes}m {secs}s remaining"
+    return f"{secs}s remaining"
 
 
 def blocked_domains_for_payload(config: dict[str, Any]) -> list[str]:
@@ -767,7 +830,8 @@ def _read_bytes_or_none(path: Path) -> bytes | None:
         return None
 
 
-def _rollback(original_hosts: str, previous_config: bytes | None, unit_existed: bool) -> None:
+def _rollback(original_hosts: str, previous_config: bytes | None, unit_existed: bool,
+              previous_lock_state: bytes | None = None) -> None:
     """Best-effort restore after a failed apply."""
     with contextlib.suppress(Exception):
         _write_hosts(original_hosts)
@@ -776,6 +840,11 @@ def _rollback(original_hosts: str, previous_config: bytes | None, unit_existed: 
             CONFIG_FILE.unlink(missing_ok=True)
         else:
             _atomic_write(CONFIG_FILE, previous_config, 0o644)
+    with contextlib.suppress(Exception):
+        if previous_lock_state is None:
+            LOCK_STATE_FILE.unlink(missing_ok=True)
+        else:
+            _atomic_write(LOCK_STATE_FILE, previous_lock_state, 0o644)
     if not unit_existed:
         with contextlib.suppress(Exception):
             _remove_browser_service()
@@ -792,6 +861,7 @@ def apply_system_config(raw_payload: dict[str, Any]) -> str:
     all_domains = blocked_domains_for_payload(config)
 
     with _exclusive_lock():
+        _ensure_rules_unlocked()
         original_hosts = _read_hosts()
         updated_hosts = render_hosts(original_hosts, all_domains)  # raises on a malformed block, before any change
 
@@ -800,8 +870,19 @@ def apply_system_config(raw_payload: dict[str, Any]) -> str:
             _atomic_write(HOSTS_BACKUP, strip_managed_hosts_block(original_hosts), 0o600)
 
         previous_config = _read_bytes_or_none(CONFIG_FILE)
+        previous_lock_state = _read_bytes_or_none(LOCK_STATE_FILE)
         unit_existed = UNIT_FILE.exists()
         try:
+            has_active_rules = bool(all_domains or config["block_browsers"])
+            # Establish the lock before changing the rules. If this process is interrupted,
+            # the system fails closed instead of leaving newly-applied rules editable.
+            if config["lock_minutes"] > 0 and has_active_rules:
+                lock_until = time.time() + config["lock_minutes"] * 60
+                _atomic_write(LOCK_STATE_FILE, json.dumps({"lock_until": lock_until}, indent=2) + "\n", 0o644)
+                lock_msg = f" Rule changes are locked for {config['lock_minutes']} minute(s)."
+            else:
+                LOCK_STATE_FILE.unlink(missing_ok=True)
+                lock_msg = ""
             if updated_hosts != original_hosts:
                 _write_hosts(updated_hosts)
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -814,23 +895,25 @@ def apply_system_config(raw_payload: dict[str, Any]) -> str:
                 _remove_browser_service()
                 browser_msg = "Browser guard disabled."
         except Exception as exc:
-            _rollback(original_hosts, previous_config, unit_existed)
+            _rollback(original_hosts, previous_config, unit_existed, previous_lock_state)
             raise FocusBlockerError(f"Applying settings failed and was rolled back: {exc}") from exc
 
     _flush_dns()
-    return f"Applied {len(expand_domain_hosts(all_domains))} hostname(s). {browser_msg}"
+    return f"Applied {len(expand_domain_hosts(all_domains))} hostname(s). {browser_msg}{lock_msg}"
 
 
 def remove_all_system_rules() -> str:
     """Remove FocusBlocker-managed hosts entries and its browser guard service."""
     _require_root()
     with _exclusive_lock():
+        _ensure_rules_unlocked()
         existing = _read_hosts()
         if has_managed_hosts_block(existing):
             _write_hosts(render_hosts(existing, []))
         _remove_browser_service()
         with contextlib.suppress(OSError):
             CONFIG_FILE.unlink(missing_ok=True)
+            LOCK_STATE_FILE.unlink(missing_ok=True)
             if CONFIG_DIR.exists() and not any(CONFIG_DIR.iterdir()):
                 CONFIG_DIR.rmdir()
     _flush_dns()
@@ -838,13 +921,17 @@ def remove_all_system_rules() -> str:
             f"The backup {HOSTS_BACKUP} was kept.")
 
 
-def _remove_legacy_install() -> None:
-    """Remove the 2.0.x layout (/usr/local/lib/focusblocker). Only the known file and an empty dir."""
+def _remove_legacy_install() -> bool:
+    """Remove the 2.0.x layout (/usr/local/lib/focusblocker). Only the known file and an empty dir.
+    Returns True if the old script was there."""
     if LEGACY_LIB_DIR.is_symlink():
-        return
+        return False
+    legacy_script = LEGACY_LIB_DIR / "focusblocker.py"
+    found = legacy_script.exists()
     with contextlib.suppress(OSError):
-        (LEGACY_LIB_DIR / "focusblocker.py").unlink(missing_ok=True)
+        legacy_script.unlink(missing_ok=True)
         LEGACY_LIB_DIR.rmdir()
+    return found
 
 
 def install_system() -> str:
@@ -869,7 +956,11 @@ def install_system() -> str:
     _atomic_write(POLICY_FILE, POLICY_XML, 0o644)
     _atomic_write(SYSTEM_ICON_FILE, _icon_png(256), 0o644)
     _atomic_write(SYSTEM_DESKTOP_FILE, _desktop_entry(INSTALLED_SCRIPT, SYSTEM_ICON_FILE), 0o644)
-    _remove_legacy_install()
+    if _remove_legacy_install():
+        notes.append("Shortcuts created by version 2.0.x pointed at the old location and no longer work: each "
+                     "user should run `python3 focusblocker.py --install-launcher` to refresh them.")
+    if not _tk_available():
+        notes.append(f"WARNING: {TK_MISSING_HINT}. The window cannot open until then.")
     if UNIT_FILE.exists():  # an existing guard may still point at the old location
         _atomic_write(UNIT_FILE, _unit_text(), 0o644)
         _run_systemctl("daemon-reload", check=False)
@@ -1020,15 +1111,19 @@ def install_launcher() -> str:
     else:
         shortcut = desktop / "FocusBlocker.desktop"
         _atomic_write(shortcut, entry, 0o755)
-        gio = shutil.which("gio")
-        if gio:  # lets GNOME launch it without the "Allow Launching" step
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                subprocess.run([gio, "set", str(shortcut), "metadata::trusted", "true"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
-        notes.append(f"Placed a shortcut on your desktop ({shortcut}). If it shows a generic icon or a warning, "
-                     "right-click it and choose 'Allow Launching'.")
+        trusted = _mark_trusted(shortcut)  # without this GNOME shows a generic icon and ignores clicks
+        if trusted:
+            notes.append(f"Placed a shortcut on your desktop ({shortcut}) and marked it as trusted.")
+        else:
+            notes.append(f"Placed a shortcut on your desktop ({shortcut}), but it could not be marked trusted "
+                         "automatically. Right-click it and choose 'Allow Launching', otherwise clicks do nothing.")
     if script != INSTALLED_SCRIPT:
         notes.append(f"It launches {script}; run --install-launcher again if you move that file.")
+    if not _tk_available():
+        notes.append(f"WARNING: {TK_MISSING_HINT}. Until then the icon cannot open the window.")
+    notes.append("If clicking the new icon does nothing at first, log out and back in (or restart): the desktop "
+                 "only reads new menu entries and shortcut permissions when the session starts. "
+                 "`--doctor` prints a health report.")
     return " ".join(notes)
 
 
@@ -1047,6 +1142,165 @@ def remove_launcher() -> str:
             path.unlink()
             removed += 1
     return f"Removed {removed} launcher file(s)."
+
+
+# --------------------------------------------------------------------------- #
+# Startup diagnostics (a clicked icon has no terminal, so failures must be made visible)
+# --------------------------------------------------------------------------- #
+
+def _log_path() -> Path:
+    cache = os.environ.get("XDG_CACHE_HOME", "")
+    base = Path(cache) if cache.startswith("/") else Path.home() / ".cache"
+    return base / "focusblocker" / "launch.log"
+
+
+def _log_failure(text: str) -> Path | None:
+    """Append to the per-user launch log (kept small). Returns its path, or None if it can't be written."""
+    path = _log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        if path.exists() and path.stat().st_size > 100_000:
+            path.write_text("", encoding="utf-8")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+        return path
+    except OSError:
+        return None
+
+
+def _show_dialog(title: str, message: str) -> bool:
+    """Best-effort graphical error box for launches from a menu. True if some tool showed it."""
+    candidates = (
+        ("zenity", ["--error", "--no-markup", "--width=440", f"--title={title}", f"--text={message}"]),
+        ("kdialog", ["--error", message, "--title", title]),
+        ("notify-send", ["-u", "critical", title, message]),
+    )
+    for tool, args in candidates:
+        path = shutil.which(tool)
+        if path is None:
+            continue
+        try:
+            result = subprocess.run([path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=120, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode in (0, 1):  # zenity returns 1 when the box is closed with the window button
+            return True
+    return False
+
+
+def _report_gui_failure(title: str, message: str, details: str = "") -> None:
+    print(f"{APP_NAME}: {message}", file=sys.stderr)
+    log = _log_failure(f"{title}: {message}" + (f"\n{details}" if details else ""))
+    if sys.stderr is None or not sys.stderr.isatty():  # started from a menu/icon: nobody is watching stderr
+        _show_dialog(title, message + (f"\n\nDetails were saved to {log}" if log else ""))
+
+
+def run_gui_reporting_errors() -> int:
+    """Start the GUI; turn any startup failure into a visible message and a log entry."""
+    try:
+        return launch_gui()
+    except FocusBlockerError as exc:
+        _report_gui_failure("FocusBlocker can't start", str(exc))
+    except Exception as exc:  # last line of defence for a clicked icon
+        _report_gui_failure("FocusBlocker crashed", f"{type(exc).__name__}: {exc}", traceback.format_exc())
+    return 1
+
+
+def _tk_available() -> bool:
+    return importlib.util.find_spec("tkinter") is not None and importlib.util.find_spec("_tkinter") is not None
+
+
+TK_MISSING_HINT = "The Tk GUI toolkit is not installed. Install it with: sudo apt install python3-tk"
+
+
+def _desktop_file_trusted(path: Path) -> bool | None:
+    """Has GNOME been told this .desktop file may be launched? None if that can't be determined."""
+    gio = shutil.which("gio")
+    if gio is None:
+        return None
+    try:
+        out = subprocess.run([gio, "info", "-a", "metadata::trusted", str(path)], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "metadata::trusted: true" in out
+
+
+def _mark_trusted(path: Path) -> bool | None:
+    gio = shutil.which("gio")
+    if gio is None:
+        return None
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([gio, "set", str(path), "metadata::trusted", "true"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10, check=False)
+    return _desktop_file_trusted(path)
+
+
+def _desktop_exec_target(path: Path) -> str | None:
+    """The script a .desktop file launches (last word of its Exec= line)."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Exec="):
+                argv = shlex.split(line[5:].replace("%%", "%"))
+                return argv[-1] if argv else None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def diagnose() -> str:
+    """Plain-text health report for the 'clicking the icon does nothing' situation."""
+    lines = [f"{APP_NAME} {__version__} diagnostics", ""]
+
+    def add(ok: bool | None, text: str) -> None:
+        lines.append(f"[{'ok' if ok else '--' if ok is None else '!!'}] {text}")
+
+    add(None, f"Python {sys.version.split()[0]} at {sys.executable}")
+    add(_tk_available(), "Tk GUI toolkit is installed" if _tk_available() else TK_MISSING_HINT)
+    session = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
+    add(bool(session), f"Graphical session found ({session})" if session else
+        "No DISPLAY/WAYLAND_DISPLAY: run this from a terminal inside your desktop session, not over SSH")
+    add(os.geteuid() != 0, "Running as a normal user" if os.geteuid() != 0 else
+        "Running as root: the window refuses to start as root; run it without sudo")
+    problem = _installed_script_problem()
+    add(problem is None, f"Installed copy {INSTALLED_SCRIPT} is trusted" if problem is None else problem)
+
+    app_file, _icon = _user_launcher_paths()
+    places = [("Your menu entry", app_file), ("System menu entry", SYSTEM_DESKTOP_FILE)]
+    desktop = _desktop_dir()
+    if desktop is not None:
+        places.append(("Desktop shortcut", desktop / "FocusBlocker.desktop"))
+    for label, path in places:
+        if not path.exists():
+            add(None, f"{label}: not present ({path})")
+            continue
+        target = _desktop_exec_target(path)
+        if target is None or not os.path.exists(target):
+            add(False, f"{label} launches {target}, which no longer exists: rebuild it with --install-launcher")
+            continue
+        add(True, f"{label} launches {target}")
+        if label == "Desktop shortcut":
+            add(os.access(path, os.X_OK), "Desktop shortcut is executable" if os.access(path, os.X_OK) else
+                f"Desktop shortcut is not executable: chmod +x {path}")
+            trusted = _desktop_file_trusted(path)
+            add(trusted, "Desktop shortcut is trusted (double-click launches it)" if trusted else
+                "Desktop shortcut is not trusted yet: right-click it and choose 'Allow Launching'"
+                if trusted is False else "Could not check whether the shortcut is trusted (gio unavailable)")
+
+    tool = next((t for t in ("zenity", "kdialog", "notify-send") if shutil.which(t)), None)
+    add(tool is not None, f"Error pop-ups will use {tool}" if tool else
+        "No zenity/kdialog/notify-send found: startup errors can only be read from the log")
+    log = _log_path()
+    if log.exists():
+        tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-5:]
+        add(None, f"Last entries in {log}:")
+        lines.extend("      " + line for line in tail)
+    else:
+        add(None, f"No startup errors recorded ({log})")
+    lines += ["", f"To rebuild the shortcuts: python3 {shlex.quote(os.path.realpath(__file__))} --install-launcher"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -1078,21 +1332,37 @@ def _describe_failure(code: int, out: str, err: str) -> str:
 
 def launch_gui() -> int:
     if os.geteuid() == 0:
-        print(f"{APP_NAME}: run the GUI as your normal user, not as root.", file=sys.stderr)
-        return 2
+        raise FocusBlockerError("Run the GUI as your normal user, not as root (and without sudo).")
     try:
         import queue
         import threading
         import tkinter as tk
         from tkinter import messagebox, scrolledtext
-    except ImportError:
-        print("Tkinter is not installed. Run: sudo apt install python3-tk", file=sys.stderr)
-        return 2
+    except ImportError as exc:
+        raise FocusBlockerError(TK_MISSING_HINT) from exc
 
     problem = _installed_script_problem()
     existing = _load_existing_config()
+    lock_read_error = ""
+    try:
+        initial_lock_until = _read_lock_until() or 0.0
+    except FocusBlockerError as exc:
+        # Fail closed: do not let the GUI imply rules are editable when lock state is uncertain.
+        initial_lock_until = float("inf")
+        lock_read_error = str(exc)
 
-    root = tk.Tk(className="FocusBlocker")  # matches StartupWMClass in the .desktop file
+    try:
+        root = tk.Tk(className="FocusBlocker")  # matches StartupWMClass in the .desktop file
+    except tk.TclError as exc:
+        raise FocusBlockerError(f"Could not open a window ({exc}). Start FocusBlocker from your desktop "
+                                "session, not over SSH or from a root shell.") from exc
+
+    def on_callback_error(exc_type, exc, tb) -> None:  # Tk would otherwise swallow errors silently
+        log = _log_failure("Error inside the window:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+        messagebox.showerror("Unexpected error", f"{exc_type.__name__}: {exc}"
+                             + (f"\n\nDetails were saved to {log}" if log else ""), parent=root)
+
+    root.report_callback_exception = on_callback_error
     root.title(f"FocusBlocker for Ubuntu {__version__}")
     icon_image = small_icon = None
     try:
@@ -1135,10 +1405,30 @@ def launch_gui() -> int:
 
     browser_var = tk.BooleanVar(value=bool(existing and existing["block_browsers"]))
     downloads_var = tk.BooleanVar(value=bool(existing and existing["include_download_domains"]))
-    tk.Checkbutton(frame, text="Block common browser processes (Brave is not affected)",
-                   variable=browser_var).pack(anchor="w", pady=2)
-    tk.Checkbutton(frame, text="Also block common browser download/package endpoints (best effort; may affect other software)",
-                   variable=downloads_var, wraplength=670, justify="left").pack(anchor="w", pady=2)
+    browser_check = tk.Checkbutton(frame, text="Block common browser processes (Brave is not affected)",
+                                   variable=browser_var)
+    browser_check.pack(anchor="w", pady=2)
+    downloads_check = tk.Checkbutton(
+        frame, text="Also block common browser download/package endpoints (best effort; may affect other software)",
+        variable=downloads_var, wraplength=670, justify="left")
+    downloads_check.pack(anchor="w", pady=2)
+
+    lock_options = {
+        "No timer": 0, "15 minutes": 15, "30 minutes": 30, "1 hour": 60,
+        "2 hours": 120, "4 hours": 240, "8 hours": 480, "24 hours": 1440, "7 days": 10080,
+    }
+    initial_minutes = existing.get("lock_minutes", 60) if existing else 60
+    initial_label = next((label for label, minutes in lock_options.items() if minutes == initial_minutes), "1 hour")
+    lock_choice_var = tk.StringVar(value=initial_label)
+    lock_row = tk.Frame(frame)
+    lock_row.pack(fill="x", pady=(8, 2))
+    tk.Label(lock_row, text="Lock rule changes after applying:").pack(side="left")
+    lock_menu = tk.OptionMenu(lock_row, lock_choice_var, *lock_options.keys())
+    lock_menu.pack(side="left", padx=(8, 0))
+    tk.Label(frame, text="While locked, website rules cannot be edited and blocking cannot be stopped until the timer expires.",
+             fg="#8a4b08", wraplength=670, justify="left").pack(anchor="w", pady=(2, 4))
+    lock_status_var = tk.StringVar(value="")
+    tk.Label(frame, textvariable=lock_status_var, fg="#a11", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
 
     note = ("Important: /etc/hosts blocks exact hostnames, not wildcard subdomains. Add subdomains separately. "
             "This does not stop a determined administrator or guarantee blocking renamed/portable browsers, VPNs, "
@@ -1152,11 +1442,33 @@ def launch_gui() -> int:
     buttons = tk.Frame(frame)
     buttons.pack(fill="x", pady=(2, 0))
 
+    lock_until = initial_lock_until
+    busy_now = False
+
     def set_busy(busy: bool) -> None:
-        state = "disabled" if (busy or problem) else "normal"
+        nonlocal busy_now
+        busy_now = busy
+        state = "disabled" if (busy or problem or lock_until > time.time()) else "normal"
         apply_button.configure(state=state)
         remove_button.configure(state=state)
+        edit_state = "disabled" if (busy or problem or lock_until > time.time()) else "normal"
+        domains_box.configure(state=edit_state)
+        browser_check.configure(state=edit_state)
+        downloads_check.configure(state=edit_state)
+        lock_menu.configure(state=edit_state)
         status_var.set("Waiting for administrator authentication..." if busy else "")
+
+    def refresh_lock_ui() -> None:
+        nonlocal lock_until
+        if lock_read_error:
+            lock_status_var.set("LOCK STATUS ERROR — controls remain disabled. " + lock_read_error)
+        elif lock_until > time.time():
+            lock_status_var.set("Rules locked: " + _format_remaining(lock_until - time.time()))
+        else:
+            lock_status_var.set("")
+            lock_until = 0.0
+        set_busy(busy_now)
+        root.after(1000, refresh_lock_ui)
 
     def run_async(title: str, args: list[str], payload: str | None) -> None:
         set_busy(True)
@@ -1177,16 +1489,23 @@ def launch_gui() -> int:
         root.after(100, poll)
 
     def poll() -> None:
+        nonlocal lock_until, lock_read_error
         try:
             title, code, out, err = results.get_nowait()
         except queue.Empty:
             root.after(100, poll)
             return
-        set_busy(False)
         if code == 0:
+            try:
+                lock_until = _read_lock_until() or 0.0
+            except FocusBlockerError as exc:
+                lock_read_error = str(exc)
+                lock_until = float("inf")
             messagebox.showinfo(title, out or "Done.", parent=root)
         else:
             messagebox.showerror(f"{title} failed", _describe_failure(code, out, err), parent=root)
+        set_busy(False)
+        refresh_lock_ui()
 
     def apply_clicked() -> None:
         try:
@@ -1198,11 +1517,14 @@ def launch_gui() -> int:
             messagebox.showerror("Too many websites", f"The limit is {MAX_DOMAINS} hostnames.", parent=root)
             return
         config = {"domains": domains, "block_browsers": bool(browser_var.get()),
-                  "include_download_domains": bool(downloads_var.get())}
+                  "include_download_domains": bool(downloads_var.get()),
+                  "lock_minutes": lock_options[lock_choice_var.get()]}
         if not messagebox.askyesno(
             "Apply system-wide changes?",
             "This will edit /etc/hosts and may enable a root-owned systemd service. "
-            "Ubuntu will ask for administrator authentication. Continue?",
+            + (f"Rule changes will then be locked for {config['lock_minutes']} minute(s). "
+               if config["lock_minutes"] else "No rule-change timer will be set. ")
+            + "Ubuntu will ask for administrator authentication. Continue?",
             parent=root,
         ):
             return
@@ -1233,6 +1555,7 @@ def launch_gui() -> int:
                               padx=12, pady=6)
     remove_button.pack(side="right")
     set_busy(False)
+    refresh_lock_ui()
 
     root.mainloop()
     return 0
@@ -1264,6 +1587,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="add a menu entry and desktop shortcut for the current user (no sudo)")
     group.add_argument("--remove-launcher", action="store_true",
                        help="remove the current user's menu entry and desktop shortcut")
+    group.add_argument("--doctor", action="store_true",
+                       help="print a health report (use this if clicking the icon does nothing)")
     group.add_argument("--apply-system", action="store_true", help=argparse.SUPPRESS)   # JSON on stdin
     group.add_argument("--remove-system", action="store_true", help=argparse.SUPPRESS)
     group.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
@@ -1276,6 +1601,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.uninstall:
             print(uninstall_system())
+            return 0
+        if args.doctor:
+            print(diagnose())
             return 0
         if args.install_launcher:
             print(install_launcher())
@@ -1293,7 +1621,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.daemon:
             return browser_guard_loop()
-        return launch_gui()
+        return run_gui_reporting_errors()
     except (FocusBlockerError, ValueError, OSError, subprocess.SubprocessError) as exc:
         print(f"{APP_NAME}: {exc}", file=sys.stderr)
         return 1
